@@ -38,16 +38,16 @@ The “Follow-me” mode:  usually this mode is often done with ultrasonic sens
 
 ## Development process of the Wireless Control Pad
 
-![](/assets/control_padV2_frontview.png)
+![](/assets/control_padV2_frontview.jpg)
 
-![](/assets/control_pad_V1_back_view.png)
+![](/assets/control_pad_V1_back_view.jpg)
 The radio RC(Remote Control) Pad is made to control the main circuit in the bot. The current version it features An analog joystick, 4-direction buttons, 4 customizable function buttons, A power LED and An indicator LED and a passive, NRF240L transceiver(Radio) and an Arduino Nano as the Microcontroller.
 
 ### Challenges Faced while building.
 
-![](/assets/control_pad_v2_opened.png)
+![](/assets/control_pad_v2_opened.jpg)
 
-![](/assets/control_pad_veroboard_circuit.png)
+![](/assets/control_pad_veroboard_circuit.jpg)
 
 Most of the issues I faced while building this control pad and with the project at large were majorly due to my inexperience with soldering and making circuits as this was my first project doing so. Here are some of the issues I faced and how I solved them.
 
@@ -64,10 +64,10 @@ The other issue where with the other four functional buttons, These buttons were
 ![](/assets/C1_Bot_v2_coveredtop.png)
 
 
-![](/assets/C1_bot_V1_mechanical_structure.png)
+![](/assets/C1_bot_V1_mechanical_structure.jpg)
 ### Mechanical Structure goal and objectives.
 
-![](/assets/C1_bot_V2_structure_topview.png)
+![](/assets/C1_bot_V2_structure_topview.jpg)
 
 ![](/assets/C1_top_side_view_2024.png)
 A structure that is durable, functional and strong enough to support all the components in the build bringing the design closer to the first  design sketch. The feature includes:  
