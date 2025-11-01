@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include <Wire.h>
 #include <PCF8574.h>
 #include <SPI.h>
@@ -6,21 +7,9 @@
 #include "driver/ledc.h"
 #include <ESP32Servo.h>
 #include <NewPing.h>
-#include "BluetoothSerial.h"
+#include <NimBLEDevice.h>
 #include <math.h>
 #include "esp_pm.h"
-
-#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
-#error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
-#endif
-
-#if !defined(CONFIG_BT_SPP_ENABLED)
-#error Serial Bluetooth not available or not enabled. It is only available for the ESP32 chip.
-#endif
-
-#define USE_PIN // Uncomment this to use PIN during pairing. The pin is specified on the line below
-// const char *pin = "1234"; // Change this to more secure PIN.
-
 
 
 #define SDA 21
@@ -69,8 +58,123 @@
 
 // neck_servo_pos_offset
 #define neck_servo_offset -10
-
 #define sonar_default_angle 50
+
+// SPI pins
+#define MOSI 23
+#define MISO 19
+#define SCK 18
+#define CE 2
+#define CSN 5
+
+static NimBLEServer* pServer;
+
+class ServerCallbacks : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
+        Serial.printf("Client address: %s\n", connInfo.getAddress().toString().c_str());
+
+        /**
+         *  We can use the connection handle here to ask for different connection parameters.
+         *  Args: connection handle, min connection interval, max connection interval
+         *  latency, supervision timeout.
+         *  Units; Min/Max Intervals: 1.25 millisecond increments.
+         *  Latency: number of intervals allowed to skip.
+         *  Timeout: 10 millisecond increments.
+         */
+        pServer->updateConnParams(connInfo.getConnHandle(), 24, 48, 0, 180);
+    }
+
+    void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
+        Serial.printf("Client disconnected - start advertising\n");
+        NimBLEDevice::startAdvertising();
+    }
+
+    void onMTUChange(uint16_t MTU, NimBLEConnInfo& connInfo) override {
+        Serial.printf("MTU updated: %u for connection ID: %u\n", MTU, connInfo.getConnHandle());
+    }
+
+    /********************* Security handled here *********************/
+    uint32_t onPassKeyDisplay() override {
+        Serial.printf("Server Passkey Display\n");
+        /**
+         * This should return a random 6 digit number for security
+         *  or make your own static passkey as done here.
+         */
+        return 1234;
+    }
+
+    void onConfirmPassKey(NimBLEConnInfo& connInfo, uint32_t pass_key) override {
+        Serial.printf("The passkey YES/NO number: %" PRIu32 "\n", pass_key);
+        /** Inject false if passkeys don't match. */
+        NimBLEDevice::injectConfirmPasskey(connInfo, true);
+    }
+
+    void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {
+        /** Check that encryption was successful, if not we disconnect the client */
+        if (!connInfo.isEncrypted()) {
+            NimBLEDevice::getServer()->disconnect(connInfo.getConnHandle());
+            Serial.printf("Encrypt connection failed - disconnecting client\n");
+            return;
+        }
+
+        Serial.printf("Secured connection to: %s\n", connInfo.getAddress().toString().c_str());
+    }
+} serverCallbacks;
+
+/** Handler class for characteristic actions */
+class CharacteristicCallbacks : public NimBLECharacteristicCallbacks {
+    void onRead(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) override {
+        Serial.printf("%s : onRead(), value: %s\n",
+                      pCharacteristic->getUUID().toString().c_str(),
+                      pCharacteristic->getValue().c_str());
+    }
+
+    void onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) override {
+        Serial.printf("%s : onWrite(), value: %s\n",
+                      pCharacteristic->getUUID().toString().c_str(),
+                      pCharacteristic->getValue().c_str());
+    }
+
+    /**
+     *  The value returned in code is the NimBLE host return code.
+     */
+    void onStatus(NimBLECharacteristic* pCharacteristic, int code) override {
+        Serial.printf("Notification/Indication return code: %d, %s\n", code, NimBLEUtils::returnCodeToString(code));
+    }
+
+    /** Peer subscribed to notifications/indications */
+    void onSubscribe(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo, uint16_t subValue) override {
+        std::string str  = "Client ID: ";
+        str             += connInfo.getConnHandle();
+        str             += " Address: ";
+        str             += connInfo.getAddress().toString();
+        if (subValue == 0) {
+            str += " Unsubscribed to ";
+        } else if (subValue == 1) {
+            str += " Subscribed to notifications for ";
+        } else if (subValue == 2) {
+            str += " Subscribed to indications for ";
+        } else if (subValue == 3) {
+            str += " Subscribed to notifications and indications for ";
+        }
+        str += std::string(pCharacteristic->getUUID());
+
+        Serial.printf("%s\n", str.c_str());
+    }
+} chrCallbacks;
+
+/** Handler class for descriptor actions */
+class DescriptorCallbacks : public NimBLEDescriptorCallbacks {
+    void onWrite(NimBLEDescriptor* pDescriptor, NimBLEConnInfo& connInfo) override {
+        std::string dscVal = pDescriptor->getValue();
+        Serial.printf("Descriptor written value: %s\n", dscVal.c_str());
+    }
+
+    void onRead(NimBLEDescriptor* pDescriptor, NimBLEConnInfo& connInfo) override {
+        Serial.printf("%s Descriptor read\n", pDescriptor->getUUID().toString().c_str());
+    }
+} dscCallbacks;
+
 // Data packet struct
 typedef struct __attribute__((packed)) rx_data_packet
 {
@@ -123,12 +227,11 @@ int global_analog_speed = 0;
 
 
 // peripherals and objects
-RF24 radio(2, 5); // CE, CSN
+RF24 radio(CE, CSN); // CE, CSN
 PCF8574 pcf8574(0X38);
-
-BluetoothSerial SerialBT;
 String device_name = "C1";
 NewPing sonar(TRIGGER_PIN, ECHO_PIN, MAX_DISTANCE);
+
 
 // Servo objects
 Servo hindlegs_servo;
@@ -137,9 +240,9 @@ Servo neck_rot_servo;
 Servo sonar_servo;
 
 // Servo pins
-const uint8_t hindlegs_servo_pin = 26;
+const uint8_t hindlegs_servo_pin = 33;
 const uint8_t forelegs_servo_pin = 32;
-const uint8_t neck_rot_servo_pin = 33;
+const uint8_t neck_rot_servo_pin = 26;
 const uint8_t sonar_servo_pin = 25;
 
 
@@ -163,6 +266,8 @@ void deactive_bt();
 void printRadiopacket(rx_data_packet structData);
 void ease_servo_to_angle(uint8_t angle, Servo easeservo);
 
+
+
 void setup() {
   // put your setup code here, to run once:
   Serial.begin(115200);
@@ -184,10 +289,7 @@ void setup() {
   sonar_servo.attach(sonar_servo_pin, 500, 2500); // attaches the servo on servo pin 32 to the servo object
 
 
-  hindlegs_servo.write(90);
-  forelegs_servo.write(90);
-  neck_rot_servo.write(90 + neck_servo_offset);
-  sonar_servo.write(sonar_default_angle);
+
   // Attach pins to channels
   ledcAttach(motorAcontrolPins[0], PWM_FREQ, pwm_resolution_bit);
   ledcAttach(motorBcontrolPins[0], PWM_FREQ, pwm_resolution_bit);
@@ -223,30 +325,35 @@ void setup() {
 
   radio.setPALevel(RF24_PA_HIGH);
   radio.startListening();
+  hindlegs_servo.write(90);
+  forelegs_servo.write(90);
+  neck_rot_servo.write(90 + neck_servo_offset);
+  sonar_servo.write(sonar_default_angle);
   Serial.println("Esp starts as receiver");
+  // delay(3000);
 
-
-  // sweepandcheck(30, 150);
-
+  // sweepandcheck(45, 135);
+  // delay(100);
+  // neck_rot_servo.write(90 + neck_servo_offset);
+  // delay(500);
+  // Serial.print("average distance is "); Serial.println(averageSonarDist());  
 }
 
 void loop() {
   // put your main code here, to run repeatedly:
-
   if (radio.available())
   {
     rx_data_packet received_data;
     radio.read(&received_data, sizeof(received_data));
     // printRadiopacket(received_data);
     radio_system_control(received_data);
-
   }
   else{
 
     halt();
   }
-  Serial.print("average distance is "); Serial.println(averageSonarDist());
-
+  readModeFromSerial();
+  // Serial.print("average distance is "); Serial.println(averageSonarDist()); 
 }
 
 
@@ -255,7 +362,6 @@ void loop() {
 
 void radio_system_control(rx_data_packet received_data)
 {
-
   bool analog_shifted_f = (atoi(received_data.y_axis_val) > stick_f_active_val) && ((atoi(received_data.x_axis_val) < stick_r_active_val) && (atoi(received_data.x_axis_val) > stick_l_active_val));
   bool analog_shifted_b = (atoi(received_data.y_axis_val) < stick_b_active_val) && ((atoi(received_data.x_axis_val) < stick_r_active_val) && (atoi(received_data.x_axis_val) > stick_l_active_val));
   bool analog_shifted_l = (atoi(received_data.x_axis_val) < stick_l_active_val) && ((atoi(received_data.y_axis_val) > stick_b_active_val) && (atoi(received_data.y_axis_val) < stick_f_active_val));
@@ -371,36 +477,46 @@ void radio_system_control(rx_data_packet received_data)
       neck_rot_servo.write(90 + neck_servo_offset);
       sonar_servo.write(sonar_default_angle);
     }
+    else if(l_two_btn_state)
+    {
+      sweepandcheck(45, 135);
+      delay(100);
+      neck_rot_servo.write(90 + neck_servo_offset);
+      delay(500);
+      Serial.print("average distance is "); Serial.println(averageSonarDist());  
+    }
   }
 
   else
   {
     halt();
   }
-  delay(70);
-  // delay(140);
+  delay(50);
 }
 
 // Motion Functions
 void analog_move_f(unsigned int y_stick_val)
 {
   unsigned int mapped_speed = map(y_stick_val, stick_f_active_val, 255, analog_base_speed, pwm_resolution);
+
   if(mapped_speed >= 4000)
   {
     mapped_speed = pwm_resolution;
   }
+  Serial.printf("Analog Stick value is %i\nMapped speed is %i\n", y_stick_val, mapped_speed);  
   ledcWrite(motorAcontrolPins[0], mapped_speed);
   ledcWrite(motorBcontrolPins[0], mapped_speed);
 
   pcf8574.write(motorAcontrolPins[1], HIGH);
   pcf8574.write(motorAcontrolPins[2], LOW); 
-  pcf8574.write(motorBcontrolPins[1], LOW);
-  digitalWrite(motorBcontrolPins[2], HIGH);    
-
   pcf8574.write(motorCcontrolPins[1], HIGH);
-  pcf8574.write(motorCcontrolPins[2], LOW); 
+  pcf8574.write(motorCcontrolPins[2], LOW);  
+
+  pcf8574.write(motorBcontrolPins[1], HIGH);
+  digitalWrite(motorBcontrolPins[2], LOW);   
   pcf8574.write(motorDcontrolPins[1], HIGH);
   pcf8574.write(motorDcontrolPins[2], LOW);
+  
 }
 
 void analog_move_b(unsigned int y_stick_val)
@@ -410,17 +526,17 @@ void analog_move_b(unsigned int y_stick_val)
   {
     mapped_speed = pwm_resolution;
   }
+  Serial.printf("Analog Stick value is %i\nMapped speed is %i\n", y_stick_val, mapped_speed);
   ledcWrite(motorAcontrolPins[0], mapped_speed);
   ledcWrite(motorBcontrolPins[0], mapped_speed);
 
   pcf8574.write(motorAcontrolPins[1], LOW);
   pcf8574.write(motorAcontrolPins[2], HIGH); 
-
-  pcf8574.write(motorBcontrolPins[1], HIGH);
-  digitalWrite(motorBcontrolPins[2], LOW);   
-
   pcf8574.write(motorCcontrolPins[1], LOW);
-  pcf8574.write(motorCcontrolPins[2], HIGH); 
+  pcf8574.write(motorCcontrolPins[2], HIGH);   
+
+  pcf8574.write(motorBcontrolPins[1], LOW);
+  digitalWrite(motorBcontrolPins[2], HIGH);   
   pcf8574.write(motorDcontrolPins[1], LOW);
   pcf8574.write(motorDcontrolPins[2], HIGH);  
 
@@ -430,36 +546,36 @@ void analog_move_b(unsigned int y_stick_val)
 void analog_l_drift(unsigned int x_stick_val)
 {
 
-  unsigned int drift_difference = map(x_stick_val, stick_r_active_val, 0, 100, 4094 - analog_base_speed);
+  unsigned int drift_difference = map(x_stick_val, stick_r_active_val, 0, 100, 4000 - analog_base_speed);
 
   ledcWrite(motorAcontrolPins[0], analog_base_speed);
   ledcWrite(motorBcontrolPins[0], (analog_base_speed + drift_difference));
 
-  pcf8574.write(motorAcontrolPins[1], LOW);
-  pcf8574.write(motorAcontrolPins[2], HIGH); 
-  pcf8574.write(motorBcontrolPins[1], LOW);
-  digitalWrite(motorBcontrolPins[2], HIGH);
+  pcf8574.write(motorAcontrolPins[1], HIGH);
+  pcf8574.write(motorAcontrolPins[2], LOW); 
+  pcf8574.write(motorCcontrolPins[1], HIGH);
+  pcf8574.write(motorCcontrolPins[2], LOW); 
 
-  pcf8574.write(motorCcontrolPins[1], LOW);
-  pcf8574.write(motorCcontrolPins[2], HIGH); 
+  pcf8574.write(motorBcontrolPins[1], HIGH);
+  digitalWrite(motorBcontrolPins[2], LOW);    
   pcf8574.write(motorDcontrolPins[1], HIGH);
   pcf8574.write(motorDcontrolPins[2], LOW);
 }
 
 void analog_r_drift(unsigned int x_stick_val)
 {
-  unsigned int drift_difference = map(x_stick_val, stick_l_active_val, 255, 100, 4094 - analog_base_speed);
+  unsigned int drift_difference = map(x_stick_val, stick_l_active_val, 255, 100, 4000 - analog_base_speed);
 
   ledcWrite(motorBcontrolPins[0], analog_base_speed);
   ledcWrite(motorAcontrolPins[0], (analog_base_speed + drift_difference));
 
   pcf8574.write(motorAcontrolPins[1], HIGH);
   pcf8574.write(motorAcontrolPins[2], LOW); 
-  pcf8574.write(motorBcontrolPins[1], LOW);
-  digitalWrite(motorBcontrolPins[2], HIGH);
-
   pcf8574.write(motorCcontrolPins[1], HIGH);
-  pcf8574.write(motorCcontrolPins[2], LOW); 
+  pcf8574.write(motorCcontrolPins[2], LOW);  
+
+  pcf8574.write(motorBcontrolPins[1], HIGH);
+  digitalWrite(motorBcontrolPins[2], LOW);    
   pcf8574.write(motorDcontrolPins[1], HIGH);
   pcf8574.write(motorDcontrolPins[2], LOW);
 }
@@ -471,8 +587,8 @@ void move_f()
 
   pcf8574.write(motorAcontrolPins[1], HIGH);
   pcf8574.write(motorAcontrolPins[2], LOW); 
-  pcf8574.write(motorBcontrolPins[1], LOW);
-  digitalWrite(motorBcontrolPins[2], HIGH);    
+  pcf8574.write(motorBcontrolPins[1], HIGH);
+  digitalWrite(motorBcontrolPins[2], LOW);    
 
   pcf8574.write(motorCcontrolPins[1], HIGH);
   pcf8574.write(motorCcontrolPins[2], LOW); 
@@ -488,9 +604,8 @@ void move_b()
 
   pcf8574.write(motorAcontrolPins[1], LOW);
   pcf8574.write(motorAcontrolPins[2], HIGH); 
-
-  pcf8574.write(motorBcontrolPins[1], HIGH);
-  digitalWrite(motorBcontrolPins[2], LOW);   
+  pcf8574.write(motorBcontrolPins[1], LOW);
+  digitalWrite(motorBcontrolPins[2], HIGH);   
 
   pcf8574.write(motorCcontrolPins[1], LOW);
   pcf8574.write(motorCcontrolPins[2], HIGH); 
@@ -504,15 +619,15 @@ void turn_l()
   ledcWrite(motorBcontrolPins[0], pwm_resolution);
 
 
-  pcf8574.write(motorAcontrolPins[1], LOW);
-  pcf8574.write(motorAcontrolPins[2], HIGH); 
-  pcf8574.write(motorCcontrolPins[1], LOW);
-  pcf8574.write(motorCcontrolPins[2], HIGH);   
+  pcf8574.write(motorAcontrolPins[1], HIGH);
+  pcf8574.write(motorAcontrolPins[2], LOW); 
+  pcf8574.write(motorCcontrolPins[1], HIGH);
+  pcf8574.write(motorCcontrolPins[2], LOW);   
 
   pcf8574.write(motorBcontrolPins[1], LOW);
-  digitalWrite(motorBcontrolPins[2], HIGH); 
-  pcf8574.write(motorDcontrolPins[1], HIGH);
-  pcf8574.write(motorDcontrolPins[2], LOW);
+  digitalWrite(motorBcontrolPins[2], HIGH);      
+  pcf8574.write(motorDcontrolPins[1], LOW);
+  pcf8574.write(motorDcontrolPins[2], HIGH);  
 }
 
 void turn_r()
@@ -521,16 +636,18 @@ void turn_r()
   ledcWrite(motorBcontrolPins[0], pwm_resolution);
 
 
-  pcf8574.write(motorAcontrolPins[1], HIGH);
-  pcf8574.write(motorAcontrolPins[2], LOW); 
-  pcf8574.write(motorCcontrolPins[1], HIGH);
-  pcf8574.write(motorCcontrolPins[2], LOW);   
+  pcf8574.write(motorAcontrolPins[1], LOW);
+  pcf8574.write(motorAcontrolPins[2], HIGH); 
+  pcf8574.write(motorCcontrolPins[1], LOW);
+  pcf8574.write(motorCcontrolPins[2], HIGH); 
 
   pcf8574.write(motorBcontrolPins[1], HIGH);
-  digitalWrite(motorBcontrolPins[2], LOW); 
-  pcf8574.write(motorDcontrolPins[1], LOW);
-  pcf8574.write(motorDcontrolPins[2], HIGH);
+  digitalWrite(motorBcontrolPins[2], LOW);   
+  pcf8574.write(motorDcontrolPins[1], HIGH);
+  pcf8574.write(motorDcontrolPins[2], LOW);
 }
+
+
 
 void halt()
 {
@@ -552,22 +669,6 @@ void halt()
 
 
 // BT functions
-bool activate_bt()
-{
-
-  if(SerialBT.begin(device_name))
-  {
-    Serial.printf("The device with name \"%s\" is started.\nNow you can pair it with Bluetooth!\n", device_name.c_str());    
-    return true;    
-  }
-  return false;
-
-}
-
-void deactive_bt()
-{
-  SerialBT.end();
-}
 
 
 void printRadiopacket(rx_data_packet structData)
@@ -625,7 +726,6 @@ float averageSonarDist()
 void sweepandcheck(uint8_t startAngle, uint8_t endAngle)
 {
   // let's  start with finding the length of one obstacle
-
   // the current version of calcsendistatangle assumes the hyp dist and adj dist gotten from the sensor is that of a right-angled triangle
   // which returns a wrong value if hyp and adj isn't  that of a right angle triangle
   // to fix this, we would use the cosing rule to find the true length at the servo angle which would mean we need the sensor distance at
@@ -633,6 +733,7 @@ void sweepandcheck(uint8_t startAngle, uint8_t endAngle)
   sweeped_data returned_data;
   float hyp_dist_from_obstacle = 0;
   float adj_dist_from_obstacle = 0;
+  bool thresholdDistanceIsMaintained;
   bool obstacleIsPresent = false;
   float prev_hyp_dist_from_obstacle = 0;
   float space_width = 0;
@@ -640,131 +741,124 @@ void sweepandcheck(uint8_t startAngle, uint8_t endAngle)
   uint8_t obstacle_end_angle = 0;
 
   neck_rot_servo.write(90 + neck_servo_offset); // im using 90 + neck_servo_offset because the midpoint of my hardware setup(ultrasonic sensor and servo) is at 90 + neck_servo_offset not 90
-  delay(400);
   distAtninetyDeg = averageSonarDist();
   Serial.print("distAtninetyDeg  is "); Serial.println(distAtninetyDeg);
-  f_sonar_ground_dist = distAtninetyDeg + 1.0;
-  distAtninetyDeg = distAtninetyDeg - 1.0;
+  // f_sonar_ground_dist = distAtninetyDeg + 1.0;
   neck_rot_servo.write(90 + neck_servo_offset);
   float distAtMidpoint = averageSonarDist(); //This distance is recorded at angle 90 which would be our opposite reference angle
+  startAngle = startAngle + neck_servo_offset;
+  endAngle = endAngle + neck_servo_offset;
+
+
+
+  delay(100);
   for (uint8_t pos = startAngle; pos <= endAngle; pos++) 
   {
-    neck_rot_servo.write(pos);              // tell servo to go to position in variable 'pos'
-    // Serial.print("servo pos is "); Serial.println(neck_rot_servo.read());
+    neck_rot_servo.write(pos); // tell servo to go to position in variable 'pos'
+    // Serial.printf("Servo offset angular pos is %i\n", neck_rot_servo.read() - neck_servo_offset); 
     float average_dist = averageSonarDist();
-    // Serial.print("average distance is "); Serial.println(average_dist);
-    // Serial.println();
-
-    float distAtAngle = calcSenDistAtAngle(average_dist, neck_rot_servo.read() - 3);
+    float distAtAngle = calcSenDistAtAngle(average_dist, neck_rot_servo.read() - neck_servo_offset); 
     // Serial.print("average distance is "); Serial.println(average_dist);
     // Serial.print("calcsendist is "); Serial.println(distAtAngle);
-    if(distAtAngle >= distAtninetyDeg && distAtAngle < f_sonar_ground_dist && obstacleIsPresent == false)
-    {
-      hyp_dist_from_obstacle = average_dist;
-      prev_hyp_dist_from_obstacle = hyp_dist_from_obstacle;
-      obstacleIsPresent = true;
-      obstacle_start_angle = neck_rot_servo.read() - 3;
-      Serial.print("start angle for "); Serial.println(obstacle_start_angle);
-      Serial.print("average distance is "); Serial.println(average_dist);
-      Serial.print("servo pos is "); Serial.println(neck_rot_servo.read());
-      Serial.print("calcsendist is "); Serial.println(distAtAngle);
-      Serial.println();
-      // delay(2500);
 
-    }
-
-    else if(distAtAngle >= distAtninetyDeg && distAtAngle < f_sonar_ground_dist && obstacleIsPresent == true)
+    if((distAtAngle >= distAtninetyDeg - 3) && (distAtAngle <= distAtninetyDeg + 3))
     {
+      Serial.println("within calculated boundary");
+      if(obstacleIsPresent == false)
+      {
+        hyp_dist_from_obstacle = average_dist;
+        obstacle_start_angle = neck_rot_servo.read() - neck_servo_offset;     
+        Serial.print("start angle is "); Serial.println(obstacle_start_angle);           
+        obstacleIsPresent = true;        
+      }
       prev_hyp_dist_from_obstacle = average_dist;
-      // Serial.print("average distance is "); Serial.println(average_dist);
-      // Serial.print("servo pos is "); Serial.println(neck_rot_servo.read());
+      obstacle_end_angle = neck_rot_servo.read() - neck_servo_offset;
+      Serial.println();
+    } 
+    else
+    {     
+      if(obstacleIsPresent == true)
+      {
+        adj_dist_from_obstacle = prev_hyp_dist_from_obstacle;
+        space_width = cosine_rule(hyp_dist_from_obstacle, adj_dist_from_obstacle, (obstacle_end_angle - obstacle_start_angle));
+        Serial.print("obstacle width is "); Serial.println(space_width);
+        Serial.print("end angle for "); Serial.println(obstacle_end_angle);
+        Serial.print("average distance is "); Serial.println(average_dist);
+        Serial.println();
+        Serial.println();
+        Serial.println();        
+        // Zero all variables
+        hyp_dist_from_obstacle = 0;
+        adj_dist_from_obstacle = 0;
+        obstacle_end_angle = 0;
+        obstacle_start_angle = 0;
+        prev_hyp_dist_from_obstacle = 0;      
+        obstacleIsPresent = false;
+      }
+      Serial.printf("not within boundary\ncalcsendist is %f\n", distAtAngle);
     }
-
-    else if(distAtAngle >= f_sonar_ground_dist && obstacleIsPresent == true) // 
-    {
-      adj_dist_from_obstacle = prev_hyp_dist_from_obstacle;
-      obstacleIsPresent = false;
-      obstacle_end_angle = neck_rot_servo.read() - 3;
-      space_width = cosine_rule(hyp_dist_from_obstacle, adj_dist_from_obstacle, (obstacle_end_angle - obstacle_start_angle));
-      Serial.print("obstacle width is "); Serial.println(space_width);
-      Serial.print("end angle for "); Serial.println(obstacle_end_angle);
-      Serial.print("average distance is "); Serial.println(average_dist);
-      Serial.print("calcsendist is "); Serial.println(distAtAngle);
-      Serial.print("calcsendist at prev angle is "); Serial.println(adj_dist_from_obstacle);
-      Serial.print("servo pos is "); Serial.println(neck_rot_servo.read());
-      Serial.println("first loop");
-      Serial.println();
-      Serial.println();
-      Serial.println();
-      hyp_dist_from_obstacle = 0;
-      adj_dist_from_obstacle = 0;
-      obstacle_end_angle = 0;
-      obstacle_start_angle = 0;
-      prev_hyp_dist_from_obstacle = 0;
-      // delay(2500);
-    }
-
-    delayMicroseconds(10);                      // waits 15 ms for the servo to reach the position
-
+    // Serial.printf("\n\n");
+    delayMicroseconds(1000);                      // waits 15 ms for the servo to reach the position    
   }
-
-  // obstacleIsPresent = false;
+  
+  Serial.printf("Servo offset angular pos is %i\nServo angular pos is %i\n", neck_rot_servo.read() + neck_servo_offset, neck_rot_servo.read());
+  
   Serial.println("second loop ");
   for (uint8_t pos = endAngle; pos >= startAngle; pos--) 
   {
-    neck_rot_servo.write(pos);              // tell servo to go to position in variable 'pos'
-    // Serial.print("servo pos is "); Serial.println(neck_rot_servo.read());
+    neck_rot_servo.write(pos); // tell servo to go to position in variable 'pos'
+    // Serial.printf("Servo offset angular pos is %i\n", neck_rot_servo.read() - neck_servo_offset); 
     float average_dist = averageSonarDist();
-    // Serial.print("average distance is "); Serial.println(average_dist);
-    // Serial.println();
-    float distAtAngle = calcSenDistAtAngle(average_dist, neck_rot_servo.read() - 3);
-    // Serial.print("average distance is "); Serial.println(average_dist);
-    // Serial.print("calcsendist is "); Serial.println(distAtAngle);
-    if(distAtAngle >= distAtninetyDeg && distAtAngle < f_sonar_ground_dist && obstacleIsPresent == false)
+    float distAtAngle = calcSenDistAtAngle(average_dist, neck_rot_servo.read() - neck_servo_offset); 
+    if((distAtAngle >= distAtninetyDeg - 3) && (distAtAngle <= distAtninetyDeg + 3))
     {
-      hyp_dist_from_obstacle = average_dist;
-      prev_hyp_dist_from_obstacle = hyp_dist_from_obstacle;
-      obstacle_start_angle = neck_rot_servo.read() - 3;
-      obstacleIsPresent = true;
-      Serial.print("servo pos is "); Serial.println(neck_rot_servo.read());
-      Serial.print("start angle for "); Serial.println(obstacle_start_angle);
-      Serial.print("average distance is "); Serial.println(average_dist);
-      Serial.print("calcsendist is "); Serial.println(distAtAngle);
-      // delay(2500);
-    }
-
-    else if(distAtAngle >= distAtninetyDeg && distAtAngle < f_sonar_ground_dist && obstacleIsPresent == true)
-    {
+      Serial.println("within calculated boundary");
+      if(obstacleIsPresent == false)
+      {
+        hyp_dist_from_obstacle = average_dist;
+        obstacle_start_angle = neck_rot_servo.read() - neck_servo_offset;     
+        Serial.print("start angle is "); Serial.println(obstacle_start_angle);           
+        obstacleIsPresent = true;        
+      }
       prev_hyp_dist_from_obstacle = average_dist;
-      // Serial.print("servo pos is "); Serial.println(neck_rot_servo.read());
-      // Serial.print("average distance is "); Serial.println(average_dist);
+      obstacle_end_angle = neck_rot_servo.read() - neck_servo_offset;
+      Serial.println();
+    } 
+    else
+    {     
+      if(obstacleIsPresent == true)
+      {
+        adj_dist_from_obstacle = prev_hyp_dist_from_obstacle;
+        space_width = cosine_rule(hyp_dist_from_obstacle, adj_dist_from_obstacle, (obstacle_end_angle - obstacle_start_angle));
+        Serial.print("obstacle width is "); Serial.println(space_width);
+        Serial.print("end angle for "); Serial.println(obstacle_end_angle);
+        Serial.print("average distance is "); Serial.println(average_dist);
+        Serial.println();
+        Serial.println();
+        Serial.println();        
+        // Zero all variables
+        hyp_dist_from_obstacle = 0;
+        adj_dist_from_obstacle = 0;
+        obstacle_end_angle = 0;
+        obstacle_start_angle = 0;
+        prev_hyp_dist_from_obstacle = 0;      
+        obstacleIsPresent = false;
+      }
+      Serial.printf("not within boundary\ncalcsendist is %f\n", distAtAngle);
     }
-
-    else if(distAtAngle >= f_sonar_ground_dist && obstacleIsPresent == true)
-    {
-      adj_dist_from_obstacle = prev_hyp_dist_from_obstacle;
-      obstacleIsPresent = false;
-      obstacle_end_angle = neck_rot_servo.read() - 3;
-      space_width = cosine_rule(hyp_dist_from_obstacle, adj_dist_from_obstacle, (obstacle_end_angle - obstacle_start_angle));
-      Serial.print("obstacle width is "); Serial.println(space_width);
-      Serial.print("servo pos is "); Serial.println(neck_rot_servo.read());
-      Serial.print("end angle is "); Serial.println(obstacle_end_angle);
-      Serial.print("average distance is "); Serial.println(average_dist);
-      Serial.print("calcsendist is "); Serial.println(distAtAngle);
-      Serial.println();
-      Serial.println();
-      Serial.println();
-      hyp_dist_from_obstacle = 0;
-      adj_dist_from_obstacle = 0;
-      prev_hyp_dist_from_obstacle = 0;
-    }
-    delayMicroseconds(10);                      // waits 15 ms for the servo to reach the position    
+    // Serial.printf("\n\n");
+    delayMicroseconds(1000);                      // waits 15 ms for the servo to reach the position    
   }
 
 }
 
 float cosine_rule(float hyp, float opp, float angle)
 {
+  if(angle < 0)
+  {
+    angle = (angle * -1);
+    Serial.println("angle was changed from negative to positive");
+  }
   return sqrt(pow(hyp, 2) + pow(opp, 2) - (2 * hyp * opp) * cos(angle * DEG_TO_RAD));
 }
 
@@ -779,11 +873,11 @@ void sweepandread(uint8_t start_angle, uint8_t end_angle)
     neck_rot_servo.write(pos);              // tell servo to go to position in variable 'pos'
 
     float average_dist = averageSonarDist();
-    Serial.print("servo pos is "); Serial.println(neck_rot_servo.read());      
-    Serial.print("average distance is "); Serial.println(average_dist);
+    // Serial.print("servo pos is "); Serial.println(neck_rot_servo.read());      
+    // Serial.print("average distance is "); Serial.println(average_dist);
     Serial.print("calcSendistAtAngle is "); Serial.println(calcSenDistAtAngle(average_dist, neck_rot_servo.read()));  
     Serial.println();        
-      delayMicroseconds(10);                       // waits 15 ms for the servo to reach the position
+      delayMicroseconds(1000);                       // waits 15 ms for the servo to reach the position
   }
   for (uint8_t pos = end_angle; pos >= start_angle; pos--)
   { // goes from 180 degrees to 0 degrees
@@ -792,15 +886,14 @@ void sweepandread(uint8_t start_angle, uint8_t end_angle)
     float average_dist = averageSonarDist();
     // if(calcSenDistAtAngle(average_dist, neck_rot_servo.read()) >= 6.20)
     // {
-      Serial.print("servo pos is "); Serial.println(neck_rot_servo.read());      
-      Serial.print("average distance is "); Serial.println(average_dist);
+      // Serial.print("servo pos is "); Serial.println(neck_rot_servo.read());      
+      // Serial.print("average distance is "); Serial.println(average_dist);
       Serial.print("calcSendistAtAngle is "); Serial.println(calcSenDistAtAngle(average_dist, neck_rot_servo.read()));  
       Serial.println();        
     // }
-    delayMicroseconds(10);                       // waits 15 ms for the servo to reach the position
+    delayMicroseconds(1000);                       // waits 15 ms for the servo to reach the position
   }
   Serial.print("sweepandread back and forth took "); Serial.print(millis() - loop_start_time); Serial.println(" milliseconds");
-
 }
 
 
@@ -824,11 +917,12 @@ void readModeFromSerial()
   if(Serial.available() > 0)
   {
     String serialInput = Serial.readStringUntil('\n');
+    serialInput.toUpperCase();
     char CHAR = serialInput[0];
-    CHAR = toupper(CHAR);
-    if(CHAR == 'F' || CHAR == 'B' || CHAR == 'L' || CHAR == 'R' || CHAR == 'N' || CHAR == 'A')
+    if(CHAR == 'F' || CHAR == 'B' || CHAR == 'L' || CHAR == 'R' || CHAR == 'N' || CHAR == 'A' || CHAR == 'S')
     {
       controlMode = CHAR;   
+      Serial.printf("Control Mode is %c\n", CHAR);
       if(CHAR == 'A')
       {
         int analog_speed = (serialInput.substring(1)).toInt();
@@ -844,10 +938,28 @@ void readModeFromSerial()
           Serial.println("Enter a number between 0 and 255");
         }
       }
+      else if(CHAR == 'S')
+      {
+        Serial.println("true true true");
+        if((char)(serialInput[1]) == '1')
+        {
+          // Serial.printf("neck servo pos is %i\n", serialInput);
+          uint8_t neck_angle = (serialInput.substring(2)).toInt();
+          Serial.printf("neck_rot servo angle is %i\n", neck_angle);          
+          neck_rot_servo.write(neck_angle);
+
+        }
+        else if((char)(serialInput[1]) == '2')
+        {
+          uint8_t sonar_angle = (serialInput.substring(2)).toInt();
+          Serial.printf("sonar_rot servo angle is %i\n", sonar_angle);          
+          sonar_servo.write(sonar_angle);
+        }
+      }
     }
     else
     {
-      Serial.println("Please Enter the Character F or B or L or R to control the motors.");        
+      Serial.println("Please Enter the Character F or B or L or R to control the motors or S1angle S2angle to set servo angles");        
     }
   }
 }
@@ -892,7 +1004,6 @@ void ease_neck_servo_to_angle(uint8_t angle)
     return;
   }
 }
-
 
 void ease_servo_to_angle(uint8_t angle, Servo easeservo)
 {
